@@ -15,6 +15,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers import ReplayBuffer
 
+# Custom imports
+import mujoco
+
 
 @dataclass
 class Args:
@@ -65,14 +68,115 @@ class Args:
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
 
+    # Custom options
+    save_model: bool = False
+    """whether to save the final model"""
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+    fisac_safety: bool = False
+    """whether to train using Fisac-style safety margins instead of MuJoCo rewards"""
+
+    safety_head_geom: str = "head"
+    """MuJoCo geom name used for the HalfCheetah head"""
+
+    safety_front_foot_geom: str = "ffoot"
+    """MuJoCo geom name used for the HalfCheetah front foot"""
+
+    gamma_anneal_method: str = None
+    """method to anneal the discount factor"""
+
+    gamma_end: float = 0.99999999
+    """target discount factor"""
+
+    gamma_period: float = 500000
+    """target discount factor"""
+
+
+class FisacHalfCheetahWrapper(gym.Wrapper):
+    def __init__(self, env, head_geom_name="head", front_foot_geom_name="ffoot"):
+        super().__init__(env)
+
+        model = self.unwrapped.model
+
+        self.head_geom_id = mujoco.mj_name2id(
+            model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            head_geom_name,
+        )
+        self.front_foot_geom_id = mujoco.mj_name2id(
+            model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            front_foot_geom_name,
+        )
+
+        if self.head_geom_id < 0:
+            raise ValueError(f"Could not find geom named {head_geom_name}")
+
+        if self.front_foot_geom_id < 0:
+            raise ValueError(f"Could not find geom named {front_foot_geom_name}")
+
+    def safety_margin(self):
+        model = self.unwrapped.model
+        data = self.unwrapped.data
+
+        head_clearance = (
+            data.geom_xpos[self.head_geom_id, 2]
+            - model.geom_size[self.head_geom_id, 0]
+        )
+
+        front_foot_clearance = (
+            data.geom_xpos[self.front_foot_geom_id, 2]
+            - model.geom_size[self.front_foot_geom_id, 0]
+        )
+
+        return min(head_clearance, front_foot_clearance)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        info["safety_margin"] = self.safety_margin()
+        return obs, info
+
+    def step(self, action):
+        # l(x), the safety margin of the current state
+        current_margin = self.safety_margin()
+
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        # Useful for logging/debugging.
+        next_margin = self.safety_margin()
+        info["safety_margin"] = next_margin
+
+        # Critical: replay buffer reward now stores l(x), not MuJoCo reward.
+        reward = current_margin
+
+        return obs, reward, terminated, truncated, info
+
+
+def make_env(env_id,
+             seed,
+             idx,
+             capture_video,
+             run_name,
+             fisac_safety,
+             safety_head_geom,
+             safety_front_foot_geom):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
+            if fisac_safety:
+                env = FisacHalfCheetahWrapper(
+                    env,
+                    head_geom_name=safety_head_geom,
+                    front_foot_geom_name=safety_front_foot_geom,
+                )
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id)
+            if fisac_safety:
+                env = gym.make(env_id)
+                env = FisacHalfCheetahWrapper(
+                    env,
+                    head_geom_name=safety_head_geom,
+                    front_foot_geom_name=safety_front_foot_geom,
+                )
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.action_space.seed(seed)
         return env
@@ -86,10 +190,10 @@ class SoftQNetwork(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(
             np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
-            256,
+            64,
         )
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, 1)
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
@@ -183,7 +287,19 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [
+            make_env(
+                args.env_id,
+                args.seed + i,
+                i,
+                args.capture_video,
+                run_name,
+                args.fisac_safety,
+                args.safety_head_geom,
+                args.safety_front_foot_geom,
+            )
+            for i in range(args.num_envs)
+        ]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -259,7 +375,26 @@ if __name__ == "__main__":
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 qf2_next_target = qf2_target(data.next_observations, next_state_actions)
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+                # next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+
+                l_x = data.rewards.flatten()
+                v_next = min_qf_next_target.view(-1)
+
+                # Compute discount factor
+                if args.gamma_anneal_method == "hsu2021safety_stepped":
+                    c = 1. - args.gamma
+                    current_epoch = global_step - args.learning_starts
+                    total_epochs = args.total_timesteps - args.learning_starts
+                    gamma = min(args.gamma_end, 1. - c * 2. ** (-current_epoch // int(total_epochs / 20)))
+                elif args.gamma_anneal_method == "hsu2021safety_StepLRMargin":
+                    numDecay = int((global_step - args.learning_starts) / args.gamma_period)
+                    gamma = min(args.gamma_end, 1 - (1 - args.gamma) * (0.1 ** numDecay))
+                elif args.gamma_anneal_method is None:
+                    gamma = args.gamma
+                else:
+                    raise ValueError(f"Unknown gamma anneal method: {args.gamma_anneal_method}")
+
+                next_q_value = (1 - gamma) * l_x + gamma * torch.minimum(l_x, v_next)
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
             qf2_a_values = qf2(data.observations, data.actions).view(-1)
@@ -319,6 +454,23 @@ if __name__ == "__main__":
                 )
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+
+    # Custom code to save final model
+    if args.save_model:
+        model_path = f"runs/{run_name}/model.pt"
+        torch.save(
+            {
+                "actor": actor.state_dict(),
+                "qf1": qf1.state_dict(),
+                "qf2": qf2.state_dict(),
+                "qf1_target": qf1_target.state_dict(),
+                "qf2_target": qf2_target.state_dict(),
+                "log_alpha": log_alpha.detach().cpu() if args.autotune else None,
+                "args": vars(args),
+            },
+            model_path,
+        )
+        print(f"model saved to {model_path}")
 
     envs.close()
     writer.close()
