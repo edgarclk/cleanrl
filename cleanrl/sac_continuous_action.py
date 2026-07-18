@@ -2,7 +2,9 @@
 import os
 import random
 import time
+import math
 from dataclasses import dataclass
+from types import MethodType
 
 import gymnasium as gym
 import numpy as np
@@ -39,7 +41,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "Hopper-v4"
+    env_id: str = "HalfCheetah-v4"
     """the environment id of the task"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -75,80 +77,181 @@ class Args:
     fisac_safety: bool = False
     """whether to train using Fisac-style safety margins instead of MuJoCo rewards"""
 
-    safety_head_geom: str = "head"
-    """MuJoCo geom name used for the HalfCheetah head"""
-
-    safety_front_foot_geom: str = "ffoot"
-    """MuJoCo geom name used for the HalfCheetah front foot"""
-
     gamma_anneal_method: str = None
     """method to anneal the discount factor"""
 
-    gamma_end: float = 0.99999999
+    gamma_end: float = 0.99999
     """target discount factor"""
 
     gamma_period: float = 500000
     """target discount factor"""
 
+    max_episode_steps: int = 100
+    """max timesteps per episodes"""
+
+
+def configure_fisac_standing_reset(env):
+    base_env = env.unwrapped
+
+    base_env.init_qpos = base_env.init_qpos.copy()
+    base_env.init_qpos[2] = np.deg2rad(-70.0)
+    base_env.init_qpos[1] += 0.05
+
+    def standing_reset_model(self):
+        qpos = self.init_qpos + self.np_random.uniform(
+            low=-0.1,
+            high=0.1,
+            size=self.model.nq,
+        )
+
+        qvel = self.init_qvel + 0.1 * self.np_random.standard_normal(
+            self.model.nv
+        )
+
+        # Use much less reset noise in root height.
+        qpos[1] = self.init_qpos[1] + self.np_random.uniform(
+            low=-0.01,
+            high=0.01,
+        )
+
+        self.set_state(qpos, qvel)
+        return self._get_obs()
+
+    base_env.reset_model = MethodType(
+        standing_reset_model,
+        base_env,
+    )
+
+    return env
+
 
 class FisacHalfCheetahWrapper(gym.Wrapper):
-    def __init__(self, env, head_geom_name="head", front_foot_geom_name="ffoot"):
+    """Modern Gymnasium port of cheetah_balance.py."""
+
+    def __init__(self, env: gym.Env):
         super().__init__(env)
+        base = self.unwrapped
+        model = base.model
 
-        model = self.unwrapped.model
+        # Named IDs replace the old code's hard-coded and negative indices.
+        self.floor_geom_id = self._geom_id("floor")
+        self.head_geom_id = self._geom_id("head")
+        self.front_shin_geom_id = self._geom_id("fshin")
+        self.front_foot_geom_id = self._geom_id("ffoot")
 
-        self.head_geom_id = mujoco.mj_name2id(
-            model,
+        self.torso_body_id = self._body_id("torso")
+        self.front_thigh_body_id = self._body_id("fthigh")
+        self.front_shin_body_id = self._body_id("fshin")
+        self.front_foot_body_id = self._body_id("ffoot")
+
+        # Nominal standing initialization used in the repository.
+        base.init_qpos = base.init_qpos.copy()
+        base.init_qpos[2] = math.radians(-70.0)
+        base.init_qpos[1] += 0.05
+
+        # Patch the base environment's reset_model so Gymnasium's normal reset
+        # path uses the same standing reset distribution as the old environment.
+        def fisac_reset_model(inner_self):
+            qpos = inner_self.init_qpos + inner_self.np_random.uniform(
+                low=-0.1,
+                high=0.1,
+                size=inner_self.model.nq,
+            )
+            qvel = inner_self.init_qvel + 0.1 * inner_self.np_random.standard_normal(
+                inner_self.model.nv
+            )
+            # Limit root-height noise so the standing model is not initialized
+            # through the ground.
+            qpos[1] = inner_self.init_qpos[1] + inner_self.np_random.uniform(
+                low=-0.01,
+                high=0.01,
+            )
+            inner_self.set_state(qpos, qvel)
+            return inner_self._get_obs()
+
+        base.reset_model = MethodType(fisac_reset_model, base)
+
+    def _geom_id(self, name: str) -> int:
+        geom_id = mujoco.mj_name2id(
+            self.unwrapped.model,
             mujoco.mjtObj.mjOBJ_GEOM,
-            head_geom_name,
+            name,
         )
-        self.front_foot_geom_id = mujoco.mj_name2id(
-            model,
-            mujoco.mjtObj.mjOBJ_GEOM,
-            front_foot_geom_name,
+        if geom_id < 0:
+            raise ValueError(f"Could not find MuJoCo geom named {name!r}")
+        return geom_id
+
+    def _body_id(self, name: str) -> int:
+        body_id = mujoco.mj_name2id(
+            self.unwrapped.model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            name,
         )
+        if body_id < 0:
+            raise ValueError(f"Could not find MuJoCo body named {name!r}")
+        return body_id
 
-        if self.head_geom_id < 0:
-            raise ValueError(f"Could not find geom named {head_geom_name}")
-
-        if self.front_foot_geom_id < 0:
-            raise ValueError(f"Could not find geom named {front_foot_geom_name}")
-
-    def safety_margin(self):
-        model = self.unwrapped.model
+    def detect_contact(self) -> bool:
+        """Return whether head, front shin, or front foot contacts the floor."""
         data = self.unwrapped.data
+        unsafe_geoms = {
+            self.head_geom_id,
+            self.front_shin_geom_id,
+            self.front_foot_geom_id,
+        }
 
-        head_clearance = (
-            data.geom_xpos[self.head_geom_id, 2]
-            - model.geom_size[self.head_geom_id, 0]
+        for contact_index in range(data.ncon):
+            contact = data.contact[contact_index]
+            geom1 = int(contact.geom1)
+            geom2 = int(contact.geom2)
+            if (
+                geom1 == self.floor_geom_id and geom2 in unsafe_geoms
+            ) or (
+                geom2 == self.floor_geom_id and geom1 in unsafe_geoms
+            ):
+                return True
+        return False
+
+    def signed_distance(self) -> float:
+        """Signed distance used by the original cheetah-balance experiment.
+
+        Failure contact maps to -1. Otherwise, use the minimum of:
+          * reconstructed head clearance,
+          * front-shin body height,
+          * front-foot body height.
+        """
+        if self.detect_contact():
+            return -1.0
+
+        data = self.unwrapped.data
+        quat = data.xquat[self.torso_body_id]
+
+        # The old code uses 2*atan(q_y/q_w). atan2 is numerically safer and is
+        # equivalent in the orientation range used by this task.
+        torso_angle = 2.0 * math.atan2(float(quat[2]), float(quat[0]))
+        head_pos = (
+            float(data.xpos[self.front_thigh_body_id, 2])
+            + math.cos(torso_angle + 0.87) * 0.15
+            - 0.046
         )
 
-        front_foot_clearance = (
-            data.geom_xpos[self.front_foot_geom_id, 2]
-            - model.geom_size[self.front_foot_geom_id, 0]
-        )
-
-        return min(head_clearance, front_foot_clearance)
+        front_shin_pos = float(data.xpos[self.front_shin_body_id, 2])
+        front_foot_pos = float(data.xpos[self.front_foot_body_id, 2])
+        return float(min(front_foot_pos, head_pos, front_shin_pos))
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        info["safety_margin"] = self.safety_margin()
+        info["safety_margin"] = self.signed_distance()
         return obs, info
 
     def step(self, action):
-        # l(x), the safety margin of the current state
-        current_margin = self.safety_margin()
+        obs, _mujoco_reward, terminated, truncated, info = self.env.step(action)
 
-        obs, reward, terminated, truncated, info = self.env.step(action)
-
-        # Useful for logging/debugging.
-        next_margin = self.safety_margin()
-        info["safety_margin"] = next_margin
-
-        # Critical: replay buffer reward now stores l(x), not MuJoCo reward.
-        reward = current_margin
-
-        return obs, reward, terminated, truncated, info
+        # Important: the repository computes signed_distance() after stepping,
+        # so this reward is l(x_{t+1}) for transition (x_t, u_t, x_{t+1}).
+        margin = self.signed_distance()
+        info["safety_margin"] = margin
+        return obs, margin, terminated, truncated, info
 
 
 def make_env(env_id,
@@ -157,31 +260,46 @@ def make_env(env_id,
              capture_video,
              run_name,
              fisac_safety,
-             safety_head_geom,
-             safety_front_foot_geom):
+             max_episode_steps=100):
     def thunk():
+        render_mode = "rgb_array" if capture_video and idx == 0 else None
+        env = gym.make(
+            env_id,
+            render_mode=render_mode,
+            max_episode_steps=max_episode_steps,
+        )
+        env = FisacHalfCheetahWrapper(env)
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            if fisac_safety:
-                env = FisacHalfCheetahWrapper(
-                    env,
-                    head_geom_name=safety_head_geom,
-                    front_foot_geom_name=safety_front_foot_geom,
-                )
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            if fisac_safety:
-                env = gym.make(env_id)
-                env = FisacHalfCheetahWrapper(
-                    env,
-                    head_geom_name=safety_head_geom,
-                    front_foot_geom_name=safety_front_foot_geom,
-                )
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env.action_space.seed(seed)
+        env.action_space.seed(seed + idx)
         return env
 
     return thunk
+    # def thunk():
+    #     if capture_video and idx == 0:
+    #         env = gym.make(env_id,
+    #                        render_mode="rgb_array",
+    #                        max_episode_steps=max_episode_steps)
+    #         env = configure_fisac_standing_reset(env)
+    #         if fisac_safety:
+    #             env = FisacHalfCheetahWrapper(
+    #                 env
+    #             )
+    #         env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+    #     else:
+    #         if fisac_safety:
+    #             env = gym.make(env_id,
+    #                            max_episode_steps=max_episode_steps)
+    #             env = configure_fisac_standing_reset(env)
+    #             env = FisacHalfCheetahWrapper(
+    #                 env
+    #             )
+    #     env = gym.wrappers.RecordEpisodeStatistics(env)
+    #     env.action_space.seed(seed)
+    #     return env
+
+    # return thunk
 
 
 # ALGO LOGIC: initialize agent here:
@@ -192,8 +310,8 @@ class SoftQNetwork(nn.Module):
             np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
             64,
         )
-        self.fc2 = nn.Linear(64, 64)
-        self.fc3 = nn.Linear(64, 1)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
@@ -295,8 +413,7 @@ if __name__ == "__main__":
                 args.capture_video,
                 run_name,
                 args.fisac_safety,
-                args.safety_head_geom,
-                args.safety_front_foot_geom,
+                max_episode_steps=args.max_episode_steps
             )
             for i in range(args.num_envs)
         ]
